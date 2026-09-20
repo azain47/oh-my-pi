@@ -30,6 +30,7 @@
 ### Fixed
 
 - Improved `/tree` responsiveness for long linear session histories by avoiding quadratic ancestor metadata allocation ([#12527](https://github.com/can1357/oh-my-pi/pull/12527) by [@azain47](https://github.com/azain47)).
+- Added `Shift+Left` / `Shift+Right` navigation across visible `/tree` branches and nested fork depths ([#12623](https://github.com/can1357/oh-my-pi/pull/12623) by [@azain47](https://github.com/azain47)).
 
 ## [18.2.5] - 2026-09-17
 
