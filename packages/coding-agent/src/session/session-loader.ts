@@ -2,7 +2,15 @@ import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { ConcatSink, getBlobsDir, isEnoent, isEnotdir, parseJsonlLenient } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { Semaphore } from "../task/parallel";
-import { BlobStore, isBlobRef, lazyImageDataSync, resolveImageData, resolveImageDataUrl } from "./blob-store";
+import {
+	BlobStore,
+	isBlobRef,
+	lazyImageDataSync,
+	parseBlobRef,
+	resolveImageData,
+	resolveImageDataSync,
+	resolveImageDataUrl,
+} from "./blob-store";
 import { buildSessionContext } from "./session-context";
 import type { FileEntry, RawFileEntry, SessionEntry, SessionHeader } from "./session-entries";
 import { migrateToCurrentVersion } from "./session-migrations";
@@ -421,19 +429,18 @@ function hasImageUrl(value: unknown): value is { image_url: string } {
 	return typeof value === "object" && value !== null && "image_url" in value && typeof value.image_url === "string";
 }
 
-type BlobReferenceResolver = (data: string, asDataUrl?: boolean) => Promise<string>;
+type BlobReferenceVisit = (owner: Record<string, unknown>, key: string, asDataUrl: boolean) => void;
 
-async function resolvePersistedBlobRefs(value: unknown, resolve: BlobReferenceResolver, key?: string): Promise<void> {
+function visitPersistedBlobRefs(value: unknown, visit: BlobReferenceVisit, key?: string): void {
 	if (key !== "frames" && isExternalizableImagePosition(value, key) && isBlobRef(value.data)) {
-		value.data = await resolve(value.data);
+		visit(value as unknown as Record<string, unknown>, "data", false);
 		return;
 	}
 
 	if (Array.isArray(value)) {
-		await Promise.all(value.map(item => resolvePersistedBlobRefs(item, resolve, key)));
+		for (const item of value) visitPersistedBlobRefs(item, visit, key);
 		return;
 	}
-
 	if (typeof value !== "object" || value === null) return;
 	if (
 		"type" in value &&
@@ -442,22 +449,22 @@ async function resolvePersistedBlobRefs(value: unknown, resolve: BlobReferenceRe
 		typeof value.result === "string" &&
 		isBlobRef(value.result)
 	) {
-		value.result = await resolve(value.result);
+		visit(value as Record<string, unknown>, "result", false);
 	}
 
 	if (hasImageUrl(value) && isBlobRef(value.image_url)) {
-		value.image_url = await resolve(value.image_url, true);
+		visit(value as Record<string, unknown>, "image_url", true);
 	}
 
-	await Promise.all(
-		Object.entries(value).map(([childKey, item]) => resolvePersistedBlobRefs(item, resolve, childKey)),
-	);
+	for (const [childKey, item] of Object.entries(value)) {
+		visitPersistedBlobRefs(item, visit, childKey);
+	}
 }
 
 /**
  * Cheap synchronous precheck: does this value's tree contain any `blob:sha256:` string?
  * Early-exits on the first hit and allocates no promises, so blob-free entries skip the
- * async {@link resolvePersistedBlobRefs} descent entirely. Conservative — a blob ref in a
+ * async {@link visitPersistedBlobRefs} descent entirely. Conservative — a blob ref in a
  * non-resolved position still returns true, which only costs an extra (no-op) walk.
  */
 function containsBlobRef(value: unknown): boolean {
@@ -498,26 +505,56 @@ function repairTruncatedSnapcompactFrames(entry: FileEntry): void {
 
 async function resolveBlobRefs(values: readonly unknown[], blobStore: BlobStore): Promise<void> {
 	const semaphore = new Semaphore(BLOB_READ_CONCURRENCY);
-	const resolve: BlobReferenceResolver = async (data, asDataUrl = false) => {
-		await semaphore.acquire();
-		try {
-			return await (asDataUrl ? resolveImageDataUrl(blobStore, data) : resolveImageData(blobStore, data));
-		} finally {
-			semaphore.release();
-		}
-	};
 	const pending: Promise<void>[] = [];
+	const resolve: BlobReferenceVisit = (owner, key, asDataUrl) => {
+		const data = owner[key];
+		if (typeof data !== "string") return;
+		const task = (async () => {
+			await semaphore.acquire();
+			try {
+				owner[key] = await (asDataUrl ? resolveImageDataUrl(blobStore, data) : resolveImageData(blobStore, data));
+			} finally {
+				semaphore.release();
+			}
+		})();
+		pending.push(task);
+	};
 	for (const value of values) {
 		if (!containsBlobRef(value)) continue;
-		pending.push(resolvePersistedBlobRefs(value, resolve));
+		visitPersistedBlobRefs(value, resolve);
 	}
 	await Promise.all(pending);
+}
+
+function resolveImageDataUrlSync(blobStore: BlobStore, data: string): string {
+	const hash = parseBlobRef(data);
+	if (!hash) return data;
+	const buffer = blobStore.getSync(hash);
+	return buffer ? buffer.toString("utf8") : data;
+}
+
+function resolveBlobRefsSync(values: readonly unknown[], blobStore: BlobStore): void {
+	const resolve: BlobReferenceVisit = (owner, key, asDataUrl) => {
+		const data = owner[key];
+		if (typeof data !== "string") return;
+		owner[key] = asDataUrl ? resolveImageDataUrlSync(blobStore, data) : resolveImageDataSync(blobStore, data);
+	};
+	for (const value of values) {
+		if (!containsBlobRef(value)) continue;
+		visitPersistedBlobRefs(value, resolve);
+	}
 }
 
 export async function resolveBlobRefsInEntries(entries: FileEntry[], blobStore: BlobStore): Promise<void> {
 	const sessionEntries = entries.filter(entry => entry.type !== "session");
 	for (const entry of sessionEntries) repairTruncatedSnapcompactFrames(entry);
 	await resolveBlobRefs(sessionEntries, blobStore);
+}
+
+export function resolveBlobRefsInEntriesSync(entries: FileEntry[], blobStore: BlobStore): void {
+	const sessionEntries = entries.filter(entry => entry.type !== "session");
+	for (const entry of sessionEntries) repairTruncatedSnapcompactFrames(entry);
+	resolveBlobRefsSync(sessionEntries, blobStore);
 }
 
 /**

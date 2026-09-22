@@ -151,6 +151,16 @@ export interface SessionStorage {
 	hasAssistantTurn?(path: string): Promise<boolean>;
 	writeText(path: string, content: string): Promise<void>;
 	writeTextAtomic(path: string, content: string, options?: WriteTextAtomicOptions): Promise<void>;
+	/**
+	 * Synchronously reconcile the live file under the publish lock and atomically
+	 * publish the strings yielded by `rewrite`. This provides software-crash
+	 * durability only; it does not fsync.
+	 */
+	reconcileTextSync?(
+		path: string,
+		rewrite: (currentLines: Iterable<string> | null) => Iterable<string>,
+		options?: WriteTextAtomicOptions,
+	): number;
 	rename(path: string, nextPath: string): Promise<void>;
 	unlink(path: string): Promise<void>;
 	deleteSessionWithArtifacts(sessionPath: string): Promise<void>;
@@ -369,6 +379,34 @@ function sleepSyncMs(ms: number): void {
 	}
 	Atomics.wait(publishLockSleepBuffer, 0, 0, ms);
 }
+function* readSessionLinesFromFd(fd: number): Generator<string> {
+	const buffer = Buffer.allocUnsafe(64 * 1024);
+	let pending = Buffer.alloc(0);
+	for (;;) {
+		const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, null);
+		if (bytesRead === 0) break;
+		pending = pending.length
+			? Buffer.concat([pending, buffer.subarray(0, bytesRead)])
+			: Buffer.from(buffer.subarray(0, bytesRead));
+		let lineStart = 0;
+		for (let i = 0; i < pending.length; i++) {
+			if (pending[i] !== 0x0a) continue;
+			yield pending.subarray(lineStart, i + 1).toString("utf8");
+			lineStart = i + 1;
+		}
+		pending = pending.subarray(lineStart);
+	}
+	if (pending.length > 0) yield pending.toString("utf8");
+}
+
+export function* readSessionLinesSync(fpath: string): Generator<string> {
+	const fd = fs.openSync(fpath, "r");
+	try {
+		yield* readSessionLinesFromFd(fd);
+	} finally {
+		fs.closeSync(fd);
+	}
+}
 
 function publishLockPid(content: string): number | undefined {
 	const match = /^(\d+):(\d+)\s*$/.exec(content);
@@ -413,7 +451,7 @@ export class FileSessionStorage implements SessionStorage {
 	 * first and released last, so the lockfile claim below only ever runs
 	 * while this process provably owns the name.
 	 */
-	#withPublishLock(fpath: string, task: () => void): void {
+	#withPublishLock(fpath: string, task: () => void, streaming = false): void {
 		const lockPath = this.#publishLockPath(fpath);
 		// The lock lives beside the session file: the directory may not exist
 		// yet when the first publish creates it (writeTextSync creates it for
@@ -424,8 +462,16 @@ export class FileSessionStorage implements SessionStorage {
 		try {
 			this.#acquirePublishLock(fpath, lockPath);
 			try {
+				if (streaming) fs.writeFileSync(`${lockPath}.rewrite`, String(process.pid));
 				task();
 			} finally {
+				if (streaming) {
+					try {
+						fs.unlinkSync(`${lockPath}.rewrite`);
+					} catch (err) {
+						if (!isEnoent(err)) logger.warn("Failed to remove streaming rewrite marker", { sessionFile: fpath });
+					}
+				}
 				try {
 					fs.unlinkSync(lockPath);
 				} catch (err) {
@@ -447,11 +493,21 @@ export class FileSessionStorage implements SessionStorage {
 	 * strand it as stealable.
 	 */
 	#acquireOsPublishLock(fpath: string, lockPath: string): NativeFileLock {
-		const deadline = Date.now() + SESSION_PUBLISH_LOCK_WAIT_MS;
+		const started = Date.now();
+		let deadline = started + SESSION_PUBLISH_LOCK_WAIT_MS;
 		for (;;) {
 			const gate = NativeFileLock.tryAcquire(this.#osGatePath(lockPath));
 			if (gate.acquired) return gate;
 			gate.release();
+			// Large journal rewrites hold the gate while streaming. Wait for a
+			// live cooperating owner, still bounded; a dead owner's OS gate is
+			// reclaimed immediately, irrespective of a stale marker.
+			try {
+				const pid = Number(fs.readFileSync(`${lockPath}.rewrite`, "utf8"));
+				if (Number.isSafeInteger(pid) && pid > 0 && isPidAlive(pid)) deadline = started + 60_000;
+			} catch {
+				/* Ordinary short append/rewrite: retain the short wait. */
+			}
 			if (Date.now() >= deadline) {
 				throw new SessionLockError(fpath, "another writer holds the publish lock");
 			}
@@ -630,22 +686,22 @@ export class FileSessionStorage implements SessionStorage {
 	}
 
 	async updateSessionTitle(fpath: string, update: SessionTitleUpdate): Promise<void> {
-		const fd = fs.openSync(fpath, "r+");
-		try {
-			const buf = Buffer.from(serializeTitleSlot(update), "utf-8");
-			let offset = 0;
-			while (offset < buf.length) {
-				const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset);
-				if (written === 0) {
-					throw new Error("Short write");
+		this.#withPublishLock(fpath, () => {
+			const fd = fs.openSync(fpath, "r+");
+			try {
+				const buf = Buffer.from(serializeTitleSlot(update), "utf-8");
+				let offset = 0;
+				while (offset < buf.length) {
+					const written = fs.writeSync(fd, buf, offset, buf.length - offset, offset);
+					if (written === 0) throw new Error("Short write");
+					offset += written;
 				}
-				offset += written;
+			} catch (err) {
+				throw toError(err);
+			} finally {
+				fs.closeSync(fd);
 			}
-		} catch (err) {
-			throw toError(err);
-		} finally {
-			fs.closeSync(fd);
-		}
+		});
 	}
 
 	statSync(path: string): SessionStorageStat {
@@ -734,6 +790,82 @@ export class FileSessionStorage implements SessionStorage {
 			this.#discardTemp(tempPath, fpath);
 			throw toError(err);
 		}
+	}
+
+	reconcileTextSync(
+		fpath: string,
+		rewrite: (currentLines: Iterable<string> | null) => Iterable<string>,
+		options?: WriteTextAtomicOptions,
+	): number {
+		const dir = path.resolve(fpath, "..");
+		this.ensureDirSync(dir);
+		const tempPath = path.join(dir, `.${path.basename(fpath)}.${Snowflake.next()}.tmp`);
+		let publishedBytes = 0;
+		let cancelled = false;
+		const checkCommitGuard = (): boolean => {
+			if (!options?.commitGuard) return true;
+			const okay = options.commitGuard();
+			if (!okay) cancelled = true;
+			return okay;
+		};
+		const assertCommitGuard = (): void => {
+			if (!checkCommitGuard()) {
+				throw new Error(`Session rewrite cancelled before publish: ${fpath}`);
+			}
+		};
+		try {
+			const tempFd = fs.openSync(tempPath, "wx", 0o600);
+			let tempOpen = true;
+			try {
+				this.#withPublishLock(
+					fpath,
+					() => {
+						let sourceFd: number | undefined;
+						try {
+							try {
+								sourceFd = fs.openSync(fpath, "r");
+							} catch (err) {
+								if (!isEnoent(err)) throw toError(err);
+							}
+							assertCommitGuard();
+							const currentLines: Iterable<string> | null =
+								sourceFd === undefined ? null : readSessionLinesFromFd(sourceFd);
+							for (const line of rewrite(currentLines)) {
+								const bytes = Buffer.from(line, "utf8");
+								let offset = 0;
+								while (offset < bytes.length) {
+									const written = fs.writeSync(tempFd, bytes, offset, bytes.length - offset);
+									if (written === 0) throw new Error(`Zero-byte write while reconciling session: ${fpath}`);
+									offset += written;
+								}
+								publishedBytes += bytes.length;
+							}
+						} finally {
+							if (sourceFd !== undefined) fs.closeSync(sourceFd);
+						}
+						fs.closeSync(tempFd);
+						tempOpen = false;
+						assertCommitGuard();
+						try {
+							this.renameSync(tempPath, fpath);
+						} catch (err) {
+							if (!hasFsCode(err, "EPERM")) throw toError(err);
+							this.#replaceSessionFileAfterEpermSync(tempPath, fpath, err, checkCommitGuard);
+							if (cancelled) throw new Error(`Session rewrite cancelled before publish: ${fpath}`);
+						}
+					},
+					true,
+				);
+			} finally {
+				// The descriptor is normally closed immediately before publish.
+				// This also covers callback/read failures and partial generators.
+				if (tempOpen) fs.closeSync(tempFd);
+			}
+		} catch (err) {
+			this.#discardTemp(tempPath, fpath);
+			throw toError(err);
+		}
+		return publishedBytes;
 	}
 
 	/**

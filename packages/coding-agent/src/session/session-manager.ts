@@ -80,9 +80,18 @@ import {
 	loadSessionFile,
 	parseSessionContent,
 	resolveBlobRefsInEntries,
+	resolveBlobRefsInEntriesSync,
 	type SessionLoadResult,
 	visitEntriesFromFile,
 } from "./session-loader";
+import {
+	type JournalBaseline,
+	type JournalMerge,
+	journalHash,
+	journalRecordHash,
+	mergeSessionJournal,
+	SessionJournalConflictError,
+} from "./session-journal";
 import { generateId, migrateToCurrentVersion } from "./session-migrations";
 import {
 	computeDefaultSessionDir,
@@ -96,11 +105,17 @@ import { loadPinnedSessionIds, sortPinnedFirst } from "./session-pins";
 import {
 	FileSessionStorage,
 	MemorySessionStorage,
+	readSessionLinesSync,
 	type SessionStorage,
 	type SessionStorageWriter,
 	SessionWriteConflictError,
 } from "./session-storage";
-import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
+import {
+	type SessionTitleUpdate,
+	serializeTitleSlot,
+	parseTitleSlotLine,
+	titleUpdateFromSlot,
+} from "./session-title-slot";
 import {
 	additionalWorkspaceDirectories,
 	normalizeSessionWorkspace,
@@ -109,8 +124,6 @@ import {
 import { recordSessionTitle } from "./title-index";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
-/** Consecutive conflict reconciliations before persistence is treated as failed. */
-const MAX_RECONCILE_ATTEMPTS = 5;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
 
@@ -621,6 +634,7 @@ interface SessionManagerStateSnapshot {
 	fallbackRuntimeOnly: boolean;
 	header: SessionHeader;
 	entries: SessionEntry[];
+	journalBaseline?: JournalBaseline;
 }
 
 interface DiskQueueOptions {
@@ -712,6 +726,7 @@ export class SessionManager {
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
+	#journalBaseline: JournalBaseline = { entries: new Map(), malformed: new Map() };
 
 	/** File reflects all current entries; appends can go incrementally. */
 	#fileIsCurrent = false;
@@ -788,9 +803,6 @@ export class SessionManager {
 	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
-	/** Prevents multiple concurrent conflict-reconciliation tasks. */
-	#reconcileScheduled = false;
-	#reconcileAttempts = 0;
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
@@ -850,16 +862,6 @@ export class SessionManager {
 
 	#noteDiskFailure(errorLike: unknown): Error {
 		const error = toError(errorLike);
-		if (error instanceof SessionWriteConflictError) {
-			this.#fileIsCurrent = false;
-			this.#rewriteRequired = true;
-			this.#scheduleReconcile(error);
-			return error;
-		}
-		return this.#latchDiskFailure(error);
-	}
-
-	#latchDiskFailure(error: Error): Error {
 		if (!this.#diskFailure) this.#diskFailure = error;
 
 		if (!this.#diskFailureLogged) {
@@ -873,76 +875,6 @@ export class SessionManager {
 		}
 
 		return this.#diskFailure;
-	}
-
-	/**
-	 * Read the complete concurrent file and merge only entries this manager has
-	 * not indexed. The active leaf is intentionally restored: foreign entries
-	 * are sibling history, not a branch switch.
-	 */
-	async #reconcileSessionFile(sessionFile: string): Promise<Error | undefined> {
-		let content: string;
-		try {
-			content = await this.#storage.readText(sessionFile);
-		} catch (error) {
-			return new Error(`Cannot read session file after concurrent rewrite: ${toError(error).message}`, {
-				cause: error,
-			});
-		}
-		const loaded = parseSessionContent(content);
-		if (loaded.invalidHeader || loaded.malformedRecords > 0) {
-			return new Error("Concurrent session rewrite produced malformed or truncated session data.");
-		}
-		const leaf = this.#index.leafId();
-		let adopted = 0;
-		for (const entry of loaded.entries) {
-			if (entry.type === "session" || this.#index.has(entry.id)) continue;
-			this.#entries.push(entry as SessionEntry);
-			this.#index.insert(entry as SessionEntry);
-			adopted++;
-		}
-		this.#index.setLeaf(leaf);
-		this.#expectedDiskSize = Buffer.byteLength(content, "utf8");
-		if (adopted > 0) {
-			logger.warn("Adopted entries from a concurrent session writer", {
-				sessionFile,
-				adopted,
-			});
-		}
-		return undefined;
-	}
-
-	#scheduleReconcile(conflict: SessionWriteConflictError): void {
-		if (this.#reconcileScheduled || this.#released || !this.#persist || !this.#sessionFile) return;
-		if (this.#reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
-			this.#latchDiskFailure(new Error("Session file changed repeatedly during reconciliation."));
-			return;
-		}
-		this.#reconcileScheduled = true;
-		this.#reconcileAttempts++;
-		const sessionFile = this.#sessionFile;
-		void this.#scheduleDiskWork(
-			async () => {
-				try {
-					const reconciliationError = await this.#reconcileSessionFile(sessionFile);
-					if (reconciliationError) {
-						this.#latchDiskFailure(conflict);
-						return;
-					}
-					if (!(await this.#runFencedAtomicRewrite(this.#diskEpoch))) return;
-					this.#fileIsCurrent = true;
-					this.#rewriteRequired = false;
-					this.#hasTitleSlot = true;
-					this.#reconcileAttempts = 0;
-					this.#clearDiskError();
-				} finally {
-					this.#reconcileScheduled = false;
-				}
-			},
-			{ ignorePriorError: true },
-		).catch(() => {
-			this.#reconcileScheduled = false;
-		});
 	}
 
 	#scheduleDiskWork(work: () => Promise<void>, options: DiskQueueOptions = {}): Promise<void> {
@@ -1080,6 +1012,10 @@ export class SessionManager {
 						new Error("Session file disappeared during authoritative repair."),
 					]);
 				}
+				if (this.#storage.reconcileTextSync) {
+					this.#rewriteFileJournal(sessionFile, epoch);
+					continue;
+				}
 				const body = this.#fileBody();
 				try {
 					await this.#storage.writeTextAtomic(sessionFile, body, {
@@ -1140,8 +1076,11 @@ export class SessionManager {
 	#lineFor(entry: FileEntry): string {
 		return `${stringifyJson(prepareEntryForPersistence(entry, this.#blobs)) ?? "null"}\n`;
 	}
-	#recordDurableAppend(line: string): void {
+	#recordDurableAppend(line: string, entryId: string): void {
 		this.#expectedDiskSize = (this.#expectedDiskSize ?? 0) + Buffer.byteLength(line, "utf8");
+		if (this.#storage.reconcileTextSync) {
+			this.#journalBaseline.entries.set(entryId, journalHash(line));
+		}
 	}
 
 	#recordFullRewrite(body: string): void {
@@ -1201,6 +1140,64 @@ export class SessionManager {
 		return body;
 	}
 
+	/** Merge and publish against the live journal under one cross-process lock.
+	 * No whole-file strings and no deferred \"success\" for synchronous writers. */
+	#rewriteFileJournal(sessionFile: string, epoch: number): void {
+		const reconcile = this.#storage.reconcileTextSync;
+		if (!reconcile) throw new Error("Storage does not support journal reconciliation");
+		let merged: JournalMerge | undefined;
+		const leaf = this.#index.leafId();
+		const branch = this.#index.pathTo(leaf);
+		try {
+			const size = reconcile.call(
+				this.#storage,
+				sessionFile,
+				lines => {
+					merged = mergeSessionJournal(
+						lines,
+						this.#header,
+						this.#titleSlotLine(),
+						this.#entries,
+						this.#expectedDiskSize === null
+							? { entries: new Map(), malformed: new Map() }
+							: this.#journalBaseline,
+						entry => this.#lineFor(entry),
+						entries => resolveBlobRefsInEntriesSync(entries, this.#blobs),
+						this.#expectedDiskSize === 0,
+					);
+					return merged.lines;
+				},
+				{ commitGuard: () => !this.#released && this.#diskEpoch === epoch },
+			);
+			if (!merged) throw new Error("Journal reconciliation did not run");
+			this.#entries = merged.entries;
+			this.#journalBaseline = merged.baseline;
+			const title = titleUpdateFromSlot(parseTitleSlotLine(merged.title));
+			if (title) {
+				this.#sessionName = title.title;
+				this.#titleSource = title.source;
+				this.#titleUpdatedAt = title.updatedAt;
+			}
+			this.#index.rebuild(this.#entries);
+			const nextLeaf =
+				leaf && this.#index.has(leaf) ? leaf : (branch.findLast(entry => this.#index.has(entry.id))?.id ?? null);
+			this.#index.setLeaf(nextLeaf);
+			this.#expectedDiskSize = size;
+			this.#clearDiskError();
+		} catch (error) {
+			if (error instanceof SessionJournalConflictError) {
+				const conflict = new SessionWriteConflictError(
+					sessionFile,
+					this.#expectedDiskSize,
+					this.#storage.existsSync(sessionFile) ? this.#storage.statSync(sessionFile).size : null,
+				);
+				conflict.cause = error;
+				throw conflict;
+			}
+			throw error;
+		}
+	}
+
 	#historyContainsAssistantMessage(): boolean {
 		return this.#entries.some(isAssistantEntry);
 	}
@@ -1238,13 +1235,19 @@ export class SessionManager {
 		if (!this.#persist || !this.#shouldHaveSessionFile()) return;
 		const targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
 		if (!targetPath) return;
-		if (this.#reconcileScheduled) {
-			this.#fileIsCurrent = false;
-			this.#rewriteRequired = true;
-			return;
-		}
 
 		try {
+			if (this.#storage.reconcileTextSync) {
+				this.#diskEpoch++;
+				this.#diskTail = Promise.resolve();
+				this.#closeWriterEventually();
+				this.#rewriteFileJournal(targetPath, this.#diskEpoch);
+				this.#fileIsCurrent = targetPath === this.#sessionFile;
+				this.#rewriteRequired = !this.#fileIsCurrent;
+				this.#hasTitleSlot = true;
+				if (this.#fileIsCurrent) this.#materializeBreadcrumb();
+				return;
+			}
 			const body = this.#fileBody();
 			this.#diskEpoch++;
 			this.#diskTail = Promise.resolve();
@@ -1349,7 +1352,6 @@ export class SessionManager {
 	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
 		if (this.#released) return false;
 		this.#atomicRewriteFenceEpoch = epoch;
-		let conflictRetries = 0;
 		try {
 			do {
 				this.#atomicRewriteDirty = false;
@@ -1357,6 +1359,10 @@ export class SessionManager {
 				const sessionFile = this.#sessionFile;
 				if (!sessionFile) return false;
 				if (this.#diskEpoch !== epoch) return false;
+				if (this.#storage.reconcileTextSync) {
+					this.#rewriteFileJournal(sessionFile, epoch);
+					continue;
+				}
 				const body = this.#fileBody();
 				try {
 					await this.#storage.writeTextAtomic(sessionFile, body, {
@@ -1368,16 +1374,6 @@ export class SessionManager {
 						if ((await this.#storage.readText(sessionFile)) === body) this.#recordFullRewrite(body);
 					} catch {
 						// Preserve the original publish failure when readback is unavailable.
-					}
-					if (error instanceof SessionWriteConflictError && conflictRetries < MAX_RECONCILE_ATTEMPTS) {
-						const reconciliationError = await this.#reconcileSessionFile(sessionFile);
-						if (reconciliationError) {
-							this.#latchDiskFailure(error);
-							throw reconciliationError;
-						}
-						conflictRetries++;
-						this.#atomicRewriteDirty = true;
-						continue;
 					}
 					throw error;
 				}
@@ -1480,7 +1476,7 @@ export class SessionManager {
 			const line = this.#lineFor(entry);
 			if (writer.appendSync && !this.#storage.defersSyncPublish) {
 				writer.appendSync(line);
-				this.#recordDurableAppend(line);
+				this.#recordDurableAppend(line, entry.id);
 			} else {
 				// A backend that only queues the publish (indexed) has no synchronous
 				// durability, so the durable size may advance only once it confirms
@@ -1490,7 +1486,7 @@ export class SessionManager {
 				if (writer.appendSync) writer.appendSync(line);
 				const confirmed = writer.appendSync ? writer.flush() : writer.append(line);
 				void confirmed
-					.then(() => this.#recordDurableAppend(line))
+					.then(() => this.#recordDurableAppend(line, entry.id))
 					.catch(err => {
 						this.#fileIsCurrent = false;
 						this.#rewriteRequired = true;
@@ -1547,8 +1543,9 @@ export class SessionManager {
 				if (!sessionFile) return;
 				try {
 					await this.#appendWriter().append(line);
-					this.#recordDurableAppend(line);
+					this.#recordDurableAppend(line, entry.id);
 					await this.#storage.updateSessionTitle(sessionFile, update);
+					if (this.#storage.reconcileTextSync) this.#journalBaseline.title = serializeTitleSlot(update);
 					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;
 				} catch {
 					if (!(await this.#runFencedAtomicRewrite(epoch))) return;
@@ -1577,6 +1574,7 @@ export class SessionManager {
 		this.#diskTail = Promise.resolve();
 		this.#clearDiskError();
 		this.#expectedDiskSize = null;
+		this.#journalBaseline = { entries: new Map(), malformed: new Map() };
 		this.#reconcileSessionDirForFallback();
 		this.#sessionId = mintSessionId();
 		this.#sessionName = undefined;
@@ -1780,6 +1778,12 @@ export class SessionManager {
 			hasTitleSlot: this.#hasTitleSlot,
 			sessionFile: this.#sessionFile,
 			expectedDiskSize: this.#expectedDiskSize,
+			journalBaseline: {
+				entries: new Map(this.#journalBaseline.entries),
+				malformed: new Map(this.#journalBaseline.malformed),
+				migrationHashes: this.#journalBaseline.migrationHashes,
+				title: this.#journalBaseline.title,
+			},
 			onDisk: this.#fileIsCurrent,
 			needsRewrite: this.#rewriteRequired,
 			draftOnlySessionCleanupArmed: this.#draftOnlySessionCleanupArmed,
@@ -1829,6 +1833,14 @@ export class SessionManager {
 		this.#draftOnlySessionCleanupArmed = snapshot.draftOnlySessionCleanupArmed;
 		this.#fallbackRuntimeOnly = snapshot.fallbackRuntimeOnly;
 		this.#applyEntries(snapshot.header, [...snapshot.entries]);
+		this.#journalBaseline = snapshot.journalBaseline
+			? {
+					entries: new Map(snapshot.journalBaseline.entries),
+					malformed: new Map(snapshot.journalBaseline.malformed),
+					migrationHashes: snapshot.journalBaseline.migrationHashes,
+					title: snapshot.journalBaseline.title,
+				}
+			: { entries: new Map(), malformed: new Map() };
 		this.#additionalDirectories = snapshot.header.additionalDirectories ?? [];
 		this.#sessionName = snapshot.sessionName;
 
@@ -1870,10 +1882,12 @@ export class SessionManager {
 		// reapply it — otherwise the final rewrite would compare a stale size and
 		// reject an otherwise successful rollback.
 		const relocatedDiskSize = this.#expectedDiskSize;
+		const relocatedJournalBaseline = this.#journalBaseline;
 		this.restoreState(snapshot);
 		// Persist the captured header so disk and memory agree after a fresh open.
 		if (this.#persist && this.#sessionFile) {
 			this.#expectedDiskSize = relocatedDiskSize;
+			this.#journalBaseline = relocatedJournalBaseline;
 			this.#forceFileCreation = true;
 			this.#rewriteRequired = true;
 			await this.#rewriteAtomically();
@@ -1927,6 +1941,10 @@ export class SessionManager {
 			return;
 		}
 
+		const migrationHashes =
+			this.#storage.reconcileTextSync && (fileEntries[0] as SessionHeader).version !== CURRENT_SESSION_VERSION
+				? fileEntries.map(journalRecordHash)
+				: undefined;
 		const migrated = migrateToCurrentVersion(fileEntries);
 		await resolveBlobRefsInEntries(fileEntries, this.#blobs);
 		// loadEntriesFromFile guarantees entries[0] is a valid session header.
@@ -1957,8 +1975,27 @@ export class SessionManager {
 
 		this.#applyEntries(header, fileEntries.slice(1) as SessionEntry[]);
 		this.#expectedDiskSize = sourceSize;
+		this.#journalBaseline = { entries: new Map(), malformed: new Map(), migrationHashes };
+		if (this.#storage.reconcileTextSync) {
+			for (const entry of this.#entries)
+				this.#journalBaseline.entries.set(entry.id, journalHash(this.#lineFor(entry)));
+			if (loaded.malformedRecords > 0) {
+				// Only corruption already observed on load may be repaired. A new
+				// malformed line introduced by a peer always fails closed.
+				for (const line of readSessionLinesSync(resolvedSessionFile)) {
+					if (!line.trim() || line === this.#titleSlotLine()) continue;
+					try {
+						JSON.parse(line);
+					} catch {
+						const hash = journalHash(line);
+						this.#journalBaseline.malformed.set(hash, (this.#journalBaseline.malformed.get(hash) ?? 0) + 1);
+					}
+				}
+			}
+		}
 		this.#additionalDirectories = header.additionalDirectories ?? [];
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
+		this.#journalBaseline.title = this.#titleSlotLine();
 		this.#hasTitleSlot = titleSlot !== undefined;
 		this.#fileIsCurrent = true;
 		this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
@@ -2009,6 +2046,7 @@ export class SessionManager {
 		this.#sessionId = mintSessionId();
 		this.#sessionFile = path.join(this.#sessionDir, `${fileSafeTimestamp(timestamp)}_${this.#sessionId}.jsonl`);
 		this.#expectedDiskSize = null;
+		this.#journalBaseline = { entries: new Map(), malformed: new Map() };
 		this.#header = {
 			type: "session",
 			version: CURRENT_SESSION_VERSION,
@@ -3345,6 +3383,7 @@ export class SessionManager {
 
 		this.#sessionFile = newSessionFile;
 		this.#expectedDiskSize = null;
+		this.#journalBaseline = { entries: new Map(), malformed: new Map() };
 		this.#rewriteSynchronously();
 		this.#rememberBreadcrumb(this.#cwd, newSessionFile);
 		return newSessionFile;
