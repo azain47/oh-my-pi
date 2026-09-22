@@ -319,6 +319,40 @@ describe("selector navigation keybindings", () => {
 		expect(selected).toEqual(["promoted-message", "active-branch"]);
 	});
 
+	it("enters the first or last visible child when selection is a fork", () => {
+		const root = createMessageNode("root", null, "Root");
+		const activeBranch = createMessageNode("active-branch", "root", "Active branch");
+		const filteredBranch = createModelNode("filtered-branch", "root");
+		const promotedHead = createModelNode("promoted-head", "root");
+		const promotedMessage = createMessageNode("promoted-message", "promoted-head", "Promoted branch");
+		promotedHead.children.push(promotedMessage);
+		root.children.push(activeBranch, filteredBranch, promotedHead);
+
+		const movedRight: string[] = [];
+		const rightSelector = new TreeSelectorComponent(
+			[root],
+			"root",
+			40,
+			id => movedRight.push(id),
+			() => {},
+		);
+		rightSelector.handleInput("\x1b[1;2C");
+		rightSelector.handleInput("\n");
+
+		const movedLeft: string[] = [];
+		const leftSelector = new TreeSelectorComponent(
+			[root],
+			"root",
+			40,
+			id => movedLeft.push(id),
+			() => {},
+		);
+		leftSelector.handleInput("\x1b[1;2D");
+		leftSelector.handleInput("\n");
+
+		expect(movedRight).toEqual(["active-branch"]);
+		expect(movedLeft).toEqual(["promoted-message"]);
+	});
 	it("continues branch navigation across nested fork depths", () => {
 		const root = createMessageNode("root", null, "Root");
 		const outerActive = createMessageNode("outer-active", "root", "Outer active branch");
