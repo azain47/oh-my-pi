@@ -853,9 +853,13 @@ export class SessionManager {
 		if (error instanceof SessionWriteConflictError) {
 			this.#fileIsCurrent = false;
 			this.#rewriteRequired = true;
-			this.#scheduleReconcile();
+			this.#scheduleReconcile(error);
 			return error;
 		}
+		return this.#latchDiskFailure(error);
+	}
+
+	#latchDiskFailure(error: Error): Error {
 		if (!this.#diskFailure) this.#diskFailure = error;
 
 		if (!this.#diskFailureLogged) {
@@ -872,22 +876,22 @@ export class SessionManager {
 	}
 
 	/**
-	 * Read the complete concurrent file, reject malformed data, and merge only
-	 * entries this manager has not indexed. The active leaf is intentionally
-	 * restored: foreign entries are sibling history, not a branch switch.
+	 * Read the complete concurrent file and merge only entries this manager has
+	 * not indexed. The active leaf is intentionally restored: foreign entries
+	 * are sibling history, not a branch switch.
 	 */
-	async #reconcileSessionFile(sessionFile: string): Promise<void> {
+	async #reconcileSessionFile(sessionFile: string): Promise<Error | undefined> {
 		let content: string;
 		try {
 			content = await this.#storage.readText(sessionFile);
 		} catch (error) {
-			throw new Error(`Cannot read session file after concurrent rewrite: ${toError(error).message}`, {
+			return new Error(`Cannot read session file after concurrent rewrite: ${toError(error).message}`, {
 				cause: error,
 			});
 		}
 		const loaded = parseSessionContent(content);
 		if (loaded.invalidHeader || loaded.malformedRecords > 0) {
-			throw new Error("Concurrent session rewrite produced malformed or truncated session data.");
+			return new Error("Concurrent session rewrite produced malformed or truncated session data.");
 		}
 		const leaf = this.#index.leafId();
 		let adopted = 0;
@@ -905,12 +909,13 @@ export class SessionManager {
 				adopted,
 			});
 		}
+		return undefined;
 	}
 
-	#scheduleReconcile(): void {
+	#scheduleReconcile(conflict: SessionWriteConflictError): void {
 		if (this.#reconcileScheduled || this.#released || !this.#persist || !this.#sessionFile) return;
 		if (this.#reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
-			this.#noteDiskFailure(new Error("Session file changed repeatedly during reconciliation."));
+			this.#latchDiskFailure(new Error("Session file changed repeatedly during reconciliation."));
 			return;
 		}
 		this.#reconcileScheduled = true;
@@ -919,7 +924,11 @@ export class SessionManager {
 		void this.#scheduleDiskWork(
 			async () => {
 				this.#reconcileScheduled = false;
-				await this.#reconcileSessionFile(sessionFile);
+				const reconciliationError = await this.#reconcileSessionFile(sessionFile);
+				if (reconciliationError) {
+					this.#latchDiskFailure(conflict);
+					return;
+				}
 				if (!(await this.#runFencedAtomicRewrite(this.#diskEpoch))) return;
 				this.#fileIsCurrent = true;
 				this.#rewriteRequired = false;
@@ -1353,7 +1362,11 @@ export class SessionManager {
 						// Preserve the original publish failure when readback is unavailable.
 					}
 					if (error instanceof SessionWriteConflictError && conflictRetries < MAX_RECONCILE_ATTEMPTS) {
-						await this.#reconcileSessionFile(sessionFile);
+						const reconciliationError = await this.#reconcileSessionFile(sessionFile);
+						if (reconciliationError) {
+							this.#latchDiskFailure(error);
+							throw reconciliationError;
+						}
 						conflictRetries++;
 						this.#atomicRewriteDirty = true;
 						continue;
