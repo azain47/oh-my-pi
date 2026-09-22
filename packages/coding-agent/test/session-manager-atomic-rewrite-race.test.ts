@@ -12,7 +12,6 @@ import {
 	FileSessionStorage,
 	MemorySessionStorage,
 	type SessionStorageWriter,
-	SessionWriteConflictError,
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -328,36 +327,43 @@ describe("SessionManager atomic rewrite race", () => {
 	});
 });
 describe("SessionManager cross-process rewrite freshness", () => {
-	it("refuses to erase a durable turn appended by another manager", async () => {
+	it("adopts another manager's turn and keeps later writes durable", async () => {
 		const tempDir = TempDir.createSync("@omp-session-rewrite-conflict-");
 		try {
 			const first = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
 			await first.ensureOnDisk();
+			first.appendMessage({ role: "user", content: "first before", timestamp: Date.now() });
+			await first.flush();
 			const sessionFile = first.getSessionFile();
 			if (!sessionFile) throw new Error("Expected session file");
 
 			const second = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
 				suppressBreadcrumb: true,
 			});
-			second.appendMessage({ role: "user", content: "durable second-writer turn", timestamp: Date.now() });
+			second.appendMessage({ role: "user", content: "second writer", timestamp: Date.now() });
+			await second.rewriteEntries();
 			await second.close();
 
-			await expect(first.rewriteEntries()).rejects.toBeInstanceOf(SessionWriteConflictError);
+			first.appendMessage({ role: "user", content: "first after", timestamp: Date.now() });
+			await first.rewriteEntries();
+			first.appendMessage({ role: "user", content: "first still alive", timestamp: Date.now() });
+			await first.flush();
 
 			const reopened = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
 				suppressBreadcrumb: true,
 			});
-			expect(
-				reopened
-					.getEntries()
-					.some(
-						entry =>
-							entry.type === "message" &&
-							entry.message.role === "user" &&
-							entry.message.content === "durable second-writer turn",
-					),
-			).toBe(true);
+			const contents = reopened
+				.getEntries()
+				.flatMap(entry =>
+					entry.type === "message" && entry.message.role === "user" && typeof entry.message.content === "string"
+						? [entry.message.content]
+						: [],
+				);
+			expect(contents).toEqual(
+				expect.arrayContaining(["first before", "second writer", "first after", "first still alive"]),
+			);
 			await reopened.close();
+			await first.close();
 		} finally {
 			await tempDir.remove();
 		}

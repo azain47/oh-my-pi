@@ -6,6 +6,10 @@
 
 - `find` (and `omp find`) accepts an `omp://` docs scope: `omp://` searches every embedded harness doc and `omp://<file>.md` searches one, reporting hits as canonical `omp://` URLs that `read` opens directly, including with `:start-end` selectors ([#12758](https://github.com/can1357/oh-my-pi/pull/12758) by [@H4vC](https://github.com/H4vC)).
 
+### Fixed
+
+- Fixed concurrent OMP windows silently stopping session persistence after one writer rewrites the shared JSONL file; recoverable conflicts now reconcile foreign entries and keep later sibling-branch turns durable ([#12624](https://github.com/can1357/oh-my-pi/pull/12624) by [@ParadaCarleton](https://github.com/ParadaCarleton)).
+
 ## [18.2.8] - 2026-09-21
 
 ### Added

@@ -98,6 +98,7 @@ import {
 	MemorySessionStorage,
 	type SessionStorage,
 	type SessionStorageWriter,
+	SessionWriteConflictError,
 } from "./session-storage";
 import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
 import {
@@ -108,6 +109,8 @@ import {
 import { recordSessionTitle } from "./title-index";
 
 const JSONL_SUFFIX_LENGTH = ".jsonl".length;
+/** Consecutive conflict reconciliations before persistence is treated as failed. */
+const MAX_RECONCILE_ATTEMPTS = 5;
 const DRAFT_ONLY_SESSION_MARKER = ".draft-only-session";
 const DISCARDED_ENTRY_BRANCH_MARKER = "discarded-entry-branch";
 
@@ -785,6 +788,9 @@ export class SessionManager {
 	#inMemoryArtifactCounter = 0;
 
 	#suppressBreadcrumb = false;
+	/** Prevents multiple concurrent conflict-reconciliation tasks. */
+	#reconcileScheduled = false;
+	#reconcileAttempts = 0;
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once
@@ -844,6 +850,12 @@ export class SessionManager {
 
 	#noteDiskFailure(errorLike: unknown): Error {
 		const error = toError(errorLike);
+		if (error instanceof SessionWriteConflictError) {
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+			this.#scheduleReconcile();
+			return error;
+		}
 		if (!this.#diskFailure) this.#diskFailure = error;
 
 		if (!this.#diskFailureLogged) {
@@ -857,6 +869,68 @@ export class SessionManager {
 		}
 
 		return this.#diskFailure;
+	}
+
+	/**
+	 * Read the complete concurrent file, reject malformed data, and merge only
+	 * entries this manager has not indexed. The active leaf is intentionally
+	 * restored: foreign entries are sibling history, not a branch switch.
+	 */
+	async #reconcileSessionFile(sessionFile: string): Promise<void> {
+		let content: string;
+		try {
+			content = await this.#storage.readText(sessionFile);
+		} catch (error) {
+			throw new Error(`Cannot read session file after concurrent rewrite: ${toError(error).message}`, {
+				cause: error,
+			});
+		}
+		const loaded = parseSessionContent(content);
+		if (loaded.invalidHeader || loaded.malformedRecords > 0) {
+			throw new Error("Concurrent session rewrite produced malformed or truncated session data.");
+		}
+		const leaf = this.#index.leafId();
+		let adopted = 0;
+		for (const entry of loaded.entries) {
+			if (entry.type === "session" || this.#index.has(entry.id)) continue;
+			this.#entries.push(entry as SessionEntry);
+			this.#index.insert(entry as SessionEntry);
+			adopted++;
+		}
+		this.#index.setLeaf(leaf);
+		this.#expectedDiskSize = Buffer.byteLength(content, "utf8");
+		if (adopted > 0) {
+			logger.warn("Adopted entries from a concurrent session writer", {
+				sessionFile,
+				adopted,
+			});
+		}
+	}
+
+	#scheduleReconcile(): void {
+		if (this.#reconcileScheduled || this.#released || !this.#persist || !this.#sessionFile) return;
+		if (this.#reconcileAttempts >= MAX_RECONCILE_ATTEMPTS) {
+			this.#noteDiskFailure(new Error("Session file changed repeatedly during reconciliation."));
+			return;
+		}
+		this.#reconcileScheduled = true;
+		this.#reconcileAttempts++;
+		const sessionFile = this.#sessionFile;
+		void this.#scheduleDiskWork(
+			async () => {
+				this.#reconcileScheduled = false;
+				await this.#reconcileSessionFile(sessionFile);
+				if (!(await this.#runFencedAtomicRewrite(this.#diskEpoch))) return;
+				this.#fileIsCurrent = true;
+				this.#rewriteRequired = false;
+				this.#hasTitleSlot = true;
+				this.#reconcileAttempts = 0;
+				this.#clearDiskError();
+			},
+			{ ignorePriorError: true },
+		).catch(() => {
+			this.#reconcileScheduled = false;
+		});
 	}
 
 	#scheduleDiskWork(work: () => Promise<void>, options: DiskQueueOptions = {}): Promise<void> {
@@ -1225,8 +1299,8 @@ export class SessionManager {
 	 * atomic publish returns, so a sync append landing in the close-yield window
 	 * cannot open a fresh writer that the pending replacement would then detach
 	 * from the current JSONL path. A `commitGuard` also prevents a superseding
-	 * synchronous rewrite from being overwritten by the stale body serialized
-	 * before it ran.
+	 * synchronous rewrite from overwriting the stale body serialized before it
+	 * ran.
 	 */
 	async #rewriteAtomically(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
@@ -1258,6 +1332,7 @@ export class SessionManager {
 	async #runFencedAtomicRewrite(epoch: number): Promise<boolean> {
 		if (this.#released) return false;
 		this.#atomicRewriteFenceEpoch = epoch;
+		let conflictRetries = 0;
 		try {
 			do {
 				this.#atomicRewriteDirty = false;
@@ -1275,7 +1350,13 @@ export class SessionManager {
 					try {
 						if ((await this.#storage.readText(sessionFile)) === body) this.#recordFullRewrite(body);
 					} catch {
-						// Preserve the publish error when durable state cannot be read back.
+						// Preserve the original publish failure when readback is unavailable.
+					}
+					if (error instanceof SessionWriteConflictError && conflictRetries < MAX_RECONCILE_ATTEMPTS) {
+						await this.#reconcileSessionFile(sessionFile);
+						conflictRetries++;
+						this.#atomicRewriteDirty = true;
+						continue;
 					}
 					throw error;
 				}
