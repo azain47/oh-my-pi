@@ -923,18 +923,21 @@ export class SessionManager {
 		const sessionFile = this.#sessionFile;
 		void this.#scheduleDiskWork(
 			async () => {
-				this.#reconcileScheduled = false;
-				const reconciliationError = await this.#reconcileSessionFile(sessionFile);
-				if (reconciliationError) {
-					this.#latchDiskFailure(conflict);
-					return;
+				try {
+					const reconciliationError = await this.#reconcileSessionFile(sessionFile);
+					if (reconciliationError) {
+						this.#latchDiskFailure(conflict);
+						return;
+					}
+					if (!(await this.#runFencedAtomicRewrite(this.#diskEpoch))) return;
+					this.#fileIsCurrent = true;
+					this.#rewriteRequired = false;
+					this.#hasTitleSlot = true;
+					this.#reconcileAttempts = 0;
+					this.#clearDiskError();
+				} finally {
+					this.#reconcileScheduled = false;
 				}
-				if (!(await this.#runFencedAtomicRewrite(this.#diskEpoch))) return;
-				this.#fileIsCurrent = true;
-				this.#rewriteRequired = false;
-				this.#hasTitleSlot = true;
-				this.#reconcileAttempts = 0;
-				this.#clearDiskError();
 			},
 			{ ignorePriorError: true },
 		).catch(() => {
@@ -1235,6 +1238,11 @@ export class SessionManager {
 		if (!this.#persist || !this.#shouldHaveSessionFile()) return;
 		const targetPath = this.#liveRelocationWritePath() ?? this.#sessionFile;
 		if (!targetPath) return;
+		if (this.#reconcileScheduled) {
+			this.#fileIsCurrent = false;
+			this.#rewriteRequired = true;
+			return;
+		}
 
 		try {
 			const body = this.#fileBody();

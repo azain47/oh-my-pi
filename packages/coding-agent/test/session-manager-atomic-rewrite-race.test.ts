@@ -368,6 +368,52 @@ describe("SessionManager cross-process rewrite freshness", () => {
 			await tempDir.remove();
 		}
 	});
+	it("keeps synchronous appends queued behind pending reconciliation", async () => {
+		const tempDir = TempDir.createSync("@omp-session-sync-reconcile-");
+		let first: SessionManager | undefined;
+		let second: SessionManager | undefined;
+		let reopened: SessionManager | undefined;
+		try {
+			const seed = SessionManager.create(tempDir.path(), tempDir.path(), new FileSessionStorage());
+			await seed.ensureOnDisk();
+			seed.appendMessage({ role: "user", content: "root", timestamp: Date.now() });
+			await seed.flush();
+			const sessionFile = seed.getSessionFile();
+			if (!sessionFile) throw new Error("Expected session file");
+			await seed.close();
+
+			const original = await Bun.file(sessionFile).text();
+			await Bun.write(sessionFile, `${original}{broken}\n`);
+			first = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
+				suppressBreadcrumb: true,
+			});
+			second = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
+				suppressBreadcrumb: true,
+			});
+			await second.rewriteEntries();
+
+			first.appendMessage({ role: "user", content: "first after conflict", timestamp: Date.now() });
+			first.appendMessage({ role: "user", content: "first still alive", timestamp: Date.now() });
+			await first.flush();
+
+			reopened = await SessionManager.open(sessionFile, tempDir.path(), new FileSessionStorage(), {
+				suppressBreadcrumb: true,
+			});
+			const contents = reopened
+				.getEntries()
+				.flatMap(entry =>
+					entry.type === "message" && entry.message.role === "user" && typeof entry.message.content === "string"
+						? [entry.message.content]
+						: [],
+				);
+			expect(contents).toEqual(expect.arrayContaining(["root", "first after conflict", "first still alive"]));
+		} finally {
+			await reopened?.close().catch(() => {});
+			await second?.close().catch(() => {});
+			await first?.close().catch(() => {});
+			await tempDir.remove();
+		}
+	});
 });
 
 describe("SessionManager atomic rewrite fence spans writer.close()", () => {
