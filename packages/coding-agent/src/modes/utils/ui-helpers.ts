@@ -477,9 +477,12 @@ export class UiHelpers {
 		// occurrence of each substitution and carries the memory forward live.
 		this.ctx.servedModelTracker = new ServedModelTracker();
 		// History above the redrawn window still feeds both, so the first drawn
-		// turn gets the marker a full redraw would give it.
+		// turn gets the marker a full redraw would give it. Its settled
+		// components are dropped: session entries keep messages reachable, so a
+		// retained mapping would pin layout caches the redraw no longer shows.
 		for (let i = 0; i < start; i++) {
 			const message = messages[i]!;
+			this.ctx.transcriptMessageComponents.delete(message);
 			if (message.role !== "assistant") continue;
 			const usage = message.usage;
 			if (usage.cacheRead + usage.cacheWrite + usage.input > 0) this.ctx.lastAssistantUsage = usage;
@@ -964,7 +967,8 @@ export class UiHelpers {
 		isLiveBackgroundTask: (message: ToolResultMessage) => boolean,
 	): number {
 		if (messages.length === 0) return 0;
-		const limit = cfgDisplayTranscriptReplayLimit.get(this.ctx.settings);
+		// Config accepts any finite number; a fractional limit would index between messages.
+		const limit = Math.trunc(cfgDisplayTranscriptReplayLimit.get(this.ctx.settings));
 		if (limit <= 0 || messages.length <= limit) return 0;
 		const turnStartAtOrBefore = (index: number): number => {
 			for (let i = index; i > 0; i--) {
@@ -980,6 +984,15 @@ export class UiHelpers {
 			if (message.role === "toolResult" && isLiveBackgroundTask(message)) return turnStartAtOrBefore(i);
 		}
 		return start;
+	}
+
+	/** Resolve prose links for every assistant message the next transcript redraw draws. */
+	async refreshTranscriptLinkTargets(): Promise<void> {
+		await this.#refreshDrawnLinkTargets(
+			this.ctx.viewSession.buildTranscriptSessionContext({
+				collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
+			}),
+		);
 	}
 
 	/** Resolve prose links for the assistant messages a redraw of `context` draws. */
