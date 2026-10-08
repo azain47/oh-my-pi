@@ -353,6 +353,32 @@ describe("selector navigation keybindings", () => {
 		expect(movedRight).toEqual(["active-branch"]);
 		expect(movedLeft).toEqual(["promoted-message"]);
 	});
+
+	it("recomputes branch targets after the filter changes", () => {
+		const root = createMessageNode("root", null, "Root");
+		const activeBranch = createMessageNode("active-branch", "root", "Active branch");
+		const modelBranch = createModelNode("model-branch", "root");
+		root.children.push(activeBranch, modelBranch);
+
+		const selected: string[] = [];
+		const selector = new TreeSelectorComponent(
+			[root],
+			"active-branch",
+			40,
+			id => selected.push(id),
+			() => {},
+		);
+
+		selector.handleInput("\x1b[1;2C");
+		selector.handleInput("\n");
+		// Alt+A reveals the model-change branch hidden by the default filter.
+		selector.handleInput("\x1ba");
+		selector.handleInput("\x1b[1;2C");
+		selector.handleInput("\n");
+
+		expect(selected).toEqual(["active-branch", "model-branch"]);
+	});
+
 	it("continues branch navigation across nested fork depths", () => {
 		const root = createMessageNode("root", null, "Root");
 		const outerActive = createMessageNode("outer-active", "root", "Outer active branch");
