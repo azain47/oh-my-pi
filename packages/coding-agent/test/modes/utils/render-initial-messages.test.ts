@@ -150,6 +150,7 @@ function makeRenderCtx(
 	transcript: SessionContext,
 	showImages = true,
 	hideToolActivity = false,
+	settingOverrides: Record<string, unknown> = {},
 ): { ctx: InteractiveModeContext; chatContainer: TranscriptContainer } {
 	const chatContainer = new TranscriptContainer();
 	chatContainer.setToolActivityVisible(!hideToolActivity);
@@ -181,6 +182,7 @@ function makeRenderCtx(
 			"terminal.showImages": showImages,
 			"display.hideToolActivity": hideToolActivity,
 			"composer.recallClearedDrafts": false,
+			...settingOverrides,
 		}),
 		toolOutputExpanded: false,
 		hideToolActivity,
@@ -832,5 +834,98 @@ describe("UiHelpers.renderInitialMessages — prompt history isolation", () => {
 		await new UiHelpers(ctx).renderInitialMessages();
 
 		expect(ctx.editor.addToHistory).not.toHaveBeenCalled();
+	});
+});
+
+describe("UiHelpers.renderInitialMessages — redraw window", () => {
+	function reply(text: string, usage: Usage = emptyUsage): AssistantMessage {
+		return {
+			role: "assistant",
+			content: [{ type: "text", text }],
+			api: "anthropic-messages",
+			provider: "anthropic",
+			model: "claude-sonnet",
+			usage,
+			stopReason: "stop",
+			timestamp: 1,
+		};
+	}
+
+	function turns(count: number): AgentMessage[] {
+		return Array.from({ length: count }, (_, index): AgentMessage[] => [
+			{ role: "user", content: `question ${index}`, timestamp: index },
+			reply(`answer ${index}`),
+		]).flat();
+	}
+
+	async function redraw(messages: AgentMessage[], settingOverrides: Record<string, unknown>) {
+		const rendered = makeRenderCtx(transcriptWith(messages), true, false, settingOverrides);
+		await new UiHelpers(rendered.ctx).renderInitialMessages({ clearTerminalHistory: true });
+		return { ...rendered, text: Bun.stripANSI(rendered.chatContainer.render(120).join("\n")) };
+	}
+
+	it("draws the recent turns from the user request that opens the limit's turn", async () => {
+		// 8 messages, limit 3: the limit falls on `answer 2`, so the redraw
+		// starts at `question 2` and keeps that whole turn.
+		const { text } = await redraw(turns(4), { "display.transcriptReplayLimit": 3 });
+
+		expect(text).toContain("4 earlier messages not shown");
+		expect(text).not.toContain("question 1");
+		expect(text).not.toContain("answer 1");
+		expect(text).toContain("question 2");
+		expect(text).toContain("answer 3");
+	});
+
+	it("draws the full history when the limit is 0", async () => {
+		const { text } = await redraw(turns(4), { "display.transcriptReplayLimit": 0 });
+
+		expect(text).not.toContain("earlier message");
+		expect(text).toContain("question 0");
+	});
+
+	it("marks a cache miss on the first drawn turn against the hidden warm turn", async () => {
+		const warm: Usage = { ...emptyUsage, input: 100, cacheRead: 50_000 };
+		const cold: Usage = { ...emptyUsage, input: 100, cacheWrite: 50_000 };
+		const { text } = await redraw(
+			[
+				{ role: "user", content: "question 0", timestamp: 0 },
+				reply("answer 0", warm),
+				{ role: "user", content: "question 1", timestamp: 1 },
+				reply("answer 1", cold),
+			],
+			{ "display.transcriptReplayLimit": 2, "display.cacheMissMarker": true },
+		);
+
+		expect(text).not.toContain("answer 0");
+		expect(text).toContain("cache miss");
+	});
+
+	it("reaches back to a still-running background task so its card keeps receiving progress", async () => {
+		const messages: AgentMessage[] = [
+			{ role: "user", content: "question old", timestamp: 0 },
+			reply("answer old"),
+			{ role: "user", content: "question task", timestamp: 1 },
+			assistantToolCall("task-1", "task", { description: "background work" }),
+			{
+				role: "toolResult",
+				toolCallId: "task-1",
+				toolName: "task",
+				content: [{ type: "text", text: "Spawned background worker." }],
+				details: { async: { state: "running", jobId: "job-1" } },
+				isError: false,
+				timestamp: 2,
+			},
+			...turns(3),
+		];
+		const rendered = makeRenderCtx(transcriptWith(messages), true, false, { "display.transcriptReplayLimit": 2 });
+		Object.assign(rendered.ctx.viewSession, { getAsyncJobSnapshot: () => ({ running: [{ id: "job-1" }] }) });
+
+		await new UiHelpers(rendered.ctx).renderInitialMessages({ clearTerminalHistory: true });
+		const text = Bun.stripANSI(rendered.chatContainer.render(120).join("\n"));
+
+		expect(text).toContain("2 earlier messages not shown");
+		expect(text).not.toContain("question old");
+		expect(text).toContain("question task");
+		expect(rendered.ctx.pendingTools.has("task-1")).toBeTrue();
 	});
 });
