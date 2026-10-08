@@ -1036,6 +1036,17 @@ export class UiHelpers {
 		for (const remaining of context.messages) {
 			if (remaining === message) return false;
 		}
+		// A windowed transcript keeps its window only if the shorter surviving
+		// transcript would start at the same message; otherwise only a full
+		// redraw shows the history that now belongs above the cut. Without a
+		// window, a shorter transcript never gains one.
+		const notice = chat.children.find((child): child is HiddenHistoryNotice => child instanceof HiddenHistoryNotice);
+		if (
+			notice &&
+			this.#transcriptWindowStart(context.messages, this.#liveBackgroundTaskCheck()) !== notice.hiddenMessages
+		) {
+			return false;
+		}
 		const dropped = chat.children.slice(index);
 		for (let i = dropped.length - 1; i >= 0; i--) {
 			const child = dropped[i]!;

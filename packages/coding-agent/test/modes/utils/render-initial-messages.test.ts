@@ -928,4 +928,32 @@ describe("UiHelpers.renderInitialMessages — redraw window", () => {
 		expect(text).toContain("question task");
 		expect(rendered.ctx.pendingTools.has("task-1")).toBeTrue();
 	});
+
+	it("gives up the in-place rewind when the shorter transcript would start earlier", async () => {
+		async function rewindPastQuestion2(limit: number) {
+			const messages = turns(4);
+			const transcript = transcriptWith(messages);
+			const { ctx, chatContainer } = makeRenderCtx(transcript, true, false, {
+				"display.transcriptReplayLimit": limit,
+			});
+			const helpers = new UiHelpers(ctx);
+			await helpers.renderInitialMessages({ clearTerminalHistory: true });
+			// The session now ends before `question 2`, the first drawn request.
+			transcript.messages = messages.slice(0, 4);
+			const inPlace = helpers.truncateTranscriptFromMessage(messages[4]!);
+			return { inPlace, text: Bun.stripANSI(chatContainer.render(120).join("\n")) };
+		}
+
+		// Unwindowed, the tail is dropped in place.
+		const full = await rewindPastQuestion2(0);
+		expect(full.inPlace).toBeTrue();
+		expect(full.text).toContain("answer 1");
+		expect(full.text).not.toContain("question 2");
+
+		// Windowed, dropping in place would leave only the notice: the caller
+		// must redraw so `question 1` and `answer 1` come back.
+		const windowed = await rewindPastQuestion2(3);
+		expect(windowed.inPlace).toBeFalse();
+		expect(windowed.text).toContain("question 2");
+	});
 });

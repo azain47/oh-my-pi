@@ -8,7 +8,8 @@ export class HiddenHistoryNotice extends Text {
 	readonly #label: string;
 	#native: NativeNode | undefined;
 
-	constructor(hiddenMessages: number) {
+	/** `hiddenMessages`: transcript messages above the first drawn one. */
+	constructor(readonly hiddenMessages: number) {
 		const label = `${hiddenMessages} earlier message${hiddenMessages === 1 ? "" : "s"} not shown · /tree to browse`;
 		super(theme.fg("dim", theme.italic(label)), 1, 0);
 		this.#label = label;
