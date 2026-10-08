@@ -11,7 +11,9 @@ export class HiddenHistoryNotice extends Text {
 	/** `hiddenMessages`: transcript messages above the first drawn one. */
 	constructor(readonly hiddenMessages: number) {
 		const label = `${hiddenMessages} earlier message${hiddenMessages === 1 ? "" : "s"} not shown · /tree to browse`;
-		super(theme.fg("dim", theme.italic(label)), 1, 0);
+		super(label, 1, 0);
+		// Styled lazily so a theme switch repaints the row in the new palette.
+		this.setStyleFn(text => theme.fg("dim", theme.italic(text)));
 		this.#label = label;
 	}
 

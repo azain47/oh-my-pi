@@ -65,22 +65,25 @@ export async function refreshAssistantMessageLinkTargets(
 	messages: readonly AssistantMessage[],
 ): Promise<ReadonlyMap<string, string>> {
 	const session: SessionWithMarkdownLinkTargets = ctx.viewSession;
-	const previous = session[kMarkdownLinkTargets] ?? EMPTY_LINK_TARGETS;
 	const hrefs = new Set<string>();
 	for (const message of messages) {
 		for (const href of assistantMessageLinkHrefs(message)) hrefs.add(href);
 	}
-	if (hrefs.size === 0) return previous;
+	if (hrefs.size === 0) return session[kMarkdownLinkTargets] ?? EMPTY_LINK_TARGETS;
 	const resolved = await ctx.resolveAssistantMessageLinkHrefs([...hrefs]);
+	// Apply this batch to the map as it is now, not as it was before resolving:
+	// a concurrent refresh (a finished reply, a wider transcript redraw) may
+	// have committed its own links meanwhile.
+	const current = session[kMarkdownLinkTargets] ?? EMPTY_LINK_TARGETS;
 	let changed = false;
 	for (const href of hrefs) {
-		if (previous.get(href) !== resolved.get(href)) {
+		if (current.get(href) !== resolved.get(href)) {
 			changed = true;
 			break;
 		}
 	}
-	if (!changed) return previous;
-	const next = new Map(previous);
+	if (!changed) return current;
+	const next = new Map(current);
 	for (const href of hrefs) next.delete(href);
 	for (const [href, target] of resolved) next.set(href, target);
 	session[kMarkdownLinkTargets] = next;
