@@ -970,10 +970,12 @@ export class UiHelpers {
 		// Config accepts any finite number; a fractional limit would index between messages.
 		const limit = Math.trunc(cfgDisplayTranscriptReplayLimit.get(this.ctx.settings));
 		if (limit <= 0 || messages.length <= limit) return 0;
+		// Same turn anchors as the replay's turn timer: an agent-attributed
+		// `user` message (a mid-run steer) does not open a turn.
 		const turnStartAtOrBefore = (index: number): number => {
 			for (let i = index; i > 0; i--) {
 				const message = messages[i]!;
-				if (message.role === "user") return i;
+				if (message.role === "user" && message.attribution !== "agent") return i;
 				if (message.role === "custom" && isUserTurnInitiator(message as CustomMessage)) return i;
 			}
 			return 0;

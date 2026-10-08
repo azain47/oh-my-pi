@@ -28,9 +28,13 @@ export interface AssistantMessageHost {
 }
 
 const kMarkdownLinkTargets = Symbol("markdownLinkTargets");
+const kMarkdownLinkRequests = Symbol("markdownLinkRequests");
 type SessionWithMarkdownLinkTargets = AssistantMessageSession & {
 	[kMarkdownLinkTargets]?: ReadonlyMap<string, string>;
+	/** Latest refresh issued per href; only that refresh may commit the href. */
+	[kMarkdownLinkRequests]?: Map<string, number>;
 };
+let nextMarkdownLinkRequest = 0;
 
 /** Link destinations per text block, revalidated against the block's text (streaming blocks grow in place). */
 const textBlockHrefs = new WeakMap<TextContent, { text: string; hrefs: readonly string[] }>();
@@ -58,7 +62,9 @@ function assistantMessageLinkHrefs(message: AssistantMessage): string[] {
  * Resolve and cache the current session's model-authored prose links. Existing
  * entries remain available to synchronous transcript rebuilds; links present in
  * this batch are replaced atomically so missing resources cannot retain a stale
- * destination.
+ * destination. Concurrent refreshes (a finished reply, a wider transcript
+ * redraw) commit into the map as it is after resolving, and an href is written
+ * only by the refresh issued last for it, whichever finishes first.
  */
 export async function refreshAssistantMessageLinkTargets(
 	ctx: AssistantMessageHost,
@@ -70,22 +76,22 @@ export async function refreshAssistantMessageLinkTargets(
 		for (const href of assistantMessageLinkHrefs(message)) hrefs.add(href);
 	}
 	if (hrefs.size === 0) return session[kMarkdownLinkTargets] ?? EMPTY_LINK_TARGETS;
+	const request = ++nextMarkdownLinkRequest;
+	const latest = (session[kMarkdownLinkRequests] ??= new Map());
+	for (const href of hrefs) latest.set(href, request);
 	const resolved = await ctx.resolveAssistantMessageLinkHrefs([...hrefs]);
-	// Apply this batch to the map as it is now, not as it was before resolving:
-	// a concurrent refresh (a finished reply, a wider transcript redraw) may
-	// have committed its own links meanwhile.
 	const current = session[kMarkdownLinkTargets] ?? EMPTY_LINK_TARGETS;
-	let changed = false;
+	let next: Map<string, string> | undefined;
 	for (const href of hrefs) {
-		if (current.get(href) !== resolved.get(href)) {
-			changed = true;
-			break;
-		}
+		if (latest.get(href) !== request) continue;
+		latest.delete(href);
+		const target = resolved.get(href);
+		if (current.get(href) === target) continue;
+		next ??= new Map(current);
+		if (target === undefined) next.delete(href);
+		else next.set(href, target);
 	}
-	if (!changed) return current;
-	const next = new Map(current);
-	for (const href of hrefs) next.delete(href);
-	for (const [href, target] of resolved) next.set(href, target);
+	if (!next) return current;
 	session[kMarkdownLinkTargets] = next;
 	return next;
 }

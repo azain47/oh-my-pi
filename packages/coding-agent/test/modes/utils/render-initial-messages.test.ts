@@ -890,6 +890,23 @@ describe("UiHelpers.renderInitialMessages — redraw window", () => {
 		expect(text).toContain("question 2");
 	});
 
+	it("starts at the user prompt, not at an agent steer inside the turn", async () => {
+		const { text } = await redraw(
+			[
+				{ role: "user", content: "question 0", timestamp: 0 },
+				reply("answer 0"),
+				{ role: "user", content: "question 1", timestamp: 1 },
+				reply("working on it"),
+				{ role: "user", content: "agent steer", attribution: "agent", timestamp: 2 },
+				reply("answer 1"),
+			],
+			{ "display.transcriptReplayLimit": 2 },
+		);
+
+		expect(text).toContain("2 earlier messages not shown");
+		expect(text).toContain("question 1");
+	});
+
 	it("releases settled components of messages that move above the window", () => {
 		const messages = turns(4);
 		const { ctx } = makeRenderCtx(transcriptWith(messages), true, false, { "display.transcriptReplayLimit": 3 });
