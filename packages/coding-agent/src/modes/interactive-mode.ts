@@ -1673,8 +1673,6 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.pendingTools.clear();
 	}
 	readonly #uiHelpers: UiHelpers;
-	/** Latest `display.transcriptReplayLimit` change; older pending redraws skip. */
-	#replayLimitRedrawGeneration = 0;
 	#sttController: STTController | undefined;
 	#micCursor: MicCursor | undefined;
 	#resizeHandler?: () => void;
@@ -3532,23 +3530,15 @@ export class InteractiveMode implements InteractiveModeContext {
 		// options are baked in at build time: rebuild, then retire rows already
 		// committed to native scrollback.
 		if (
-			any("display.cacheMissMarker", "display.collapseCompacted", "display.showTokenUsage", "display.showTurnTime")
+			any(
+				"display.cacheMissMarker",
+				"display.collapseCompacted",
+				"display.showTokenUsage",
+				"display.showTurnTime",
+				"display.transcriptReplayLimit",
+			)
 		) {
 			rebuildChat = true;
-		}
-		if (any("display.transcriptReplayLimit")) {
-			// A wider window draws assistant messages whose prose links were never
-			// resolved; resolve them before the rebuild instead of after. Only the
-			// latest change redraws.
-			const generation = ++this.#replayLimitRedrawGeneration;
-			void this.#uiHelpers
-				.refreshTranscriptLinkTargets()
-				.catch(error => logger.warn("Transcript link refresh failed before redraw", { error: String(error) }))
-				.then(() => {
-					if (generation !== this.#replayLimitRedrawGeneration) return;
-					this.rebuildChatFromMessages();
-					this.ui.resetDisplay();
-				});
 		}
 		if (any("tui.renderMermaid")) {
 			setMarkdownMermaidRendering(cfgTuiRenderMermaid.get(this.settings));

@@ -988,26 +988,6 @@ export class UiHelpers {
 		return start;
 	}
 
-	/** Resolve prose links for every assistant message the next transcript redraw draws. */
-	async refreshTranscriptLinkTargets(): Promise<void> {
-		await this.#refreshDrawnLinkTargets(
-			this.ctx.viewSession.buildTranscriptSessionContext({
-				collapseCompactedHistory: cfgDisplayCollapseCompacted.get(settings),
-			}),
-		);
-	}
-
-	/** Resolve prose links for the assistant messages a redraw of `context` draws. */
-	async #refreshDrawnLinkTargets(context: SessionContext): Promise<void> {
-		const messages = context.messages;
-		const drawn: AssistantMessage[] = [];
-		for (let i = this.#transcriptWindowStart(messages, this.#liveBackgroundTaskCheck()); i < messages.length; i++) {
-			const message = messages[i]!;
-			if (message.role === "assistant") drawn.push(message);
-		}
-		await refreshAssistantMessageLinkTargets(this.ctx, drawn);
-	}
-
 	/**
 	 * Fast-path history rewind (esc-esc branch, /tree rewind to an ancestor):
 	 * drop the rendered components at/after `message` in place instead of the
@@ -1127,7 +1107,10 @@ export class UiHelpers {
 		this.ctx.initialChatRendered = false;
 		try {
 			// Resolve before replacing live component maps: streaming events may arrive during filesystem I/O.
-			await this.#refreshDrawnLinkTargets(context);
+			await refreshAssistantMessageLinkTargets(
+				this.ctx,
+				context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
+			);
 
 			this.ctx.chatContainer = stagedChatContainer;
 			this.ctx.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();
@@ -1170,7 +1153,10 @@ export class UiHelpers {
 					keepDanglingToolCalls: this.ctx.viewSession.isStreaming,
 				});
 				replayEntryCount = this.ctx.viewSession.sessionManager.getEntries().length;
-				await this.#refreshDrawnLinkTargets(context);
+				await refreshAssistantMessageLinkTargets(
+					this.ctx,
+					context.messages.filter((message): message is AssistantMessage => message.role === "assistant"),
+				);
 				stagedChatContainer.disposeChildren();
 				this.ctx.transcriptMessageComponents = new WeakMap<AgentMessage, Component>();
 				this.ctx.pendingTools.clear();
