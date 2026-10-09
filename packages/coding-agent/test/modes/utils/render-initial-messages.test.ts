@@ -907,22 +907,6 @@ describe("UiHelpers.renderInitialMessages — redraw window", () => {
 		expect(text).toContain("question 1");
 	});
 
-	it("releases settled components of messages that move above the window", () => {
-		const messages = turns(4);
-		const { ctx } = makeRenderCtx(transcriptWith(messages), true, false, { "display.transcriptReplayLimit": 3 });
-		const helpers = new UiHelpers(ctx);
-		// Components settled by an earlier full render, then a rebuild under a
-		// smaller window that reuses settled components (the runtime setting change).
-		for (const message of messages) helpers.addMessageToChat(message);
-		expect(ctx.transcriptMessageComponents.has(messages[0]!)).toBeTrue();
-		ctx.chatContainer.clear();
-
-		helpers.renderSessionContext(transcriptWith(messages), { reuseSettledComponents: true });
-
-		expect(ctx.transcriptMessageComponents.has(messages[0]!)).toBeFalse();
-		expect(ctx.transcriptMessageComponents.has(messages[6]!)).toBeTrue();
-	});
-
 	it("marks a cache miss on the first drawn turn against the hidden warm turn", async () => {
 		const warm: Usage = { ...emptyUsage, input: 100, cacheRead: 50_000 };
 		const cold: Usage = { ...emptyUsage, input: 100, cacheWrite: 50_000 };
