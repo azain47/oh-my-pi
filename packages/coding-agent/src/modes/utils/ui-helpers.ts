@@ -960,13 +960,14 @@ export class UiHelpers {
 	 * contains the limit, so tool calls stay with their results, and reaches
 	 * further back to any still-running background task so its card keeps
 	 * receiving progress. Clearing native scrollback means every drawn row is
-	 * re-sent to the terminal; earlier history stays browsable in /tree.
+	 * re-sent to the terminal; earlier history stays browsable in /tree. A
+	 * focused subagent view is drawn in full: /tree browses the main session.
 	 */
 	#transcriptWindowStart(
 		messages: readonly AgentMessage[],
 		isLiveBackgroundTask: (message: ToolResultMessage) => boolean,
 	): number {
-		if (messages.length === 0) return 0;
+		if (messages.length === 0 || this.ctx.focusedAgentId) return 0;
 		// Config accepts any finite number; a fractional limit would index between messages.
 		const limit = Math.trunc(cfgDisplayTranscriptReplayLimit.get(this.ctx.settings));
 		if (limit <= 0 || messages.length <= limit) return 0;

@@ -883,6 +883,16 @@ describe("UiHelpers.renderInitialMessages — redraw window", () => {
 		expect(text).toContain("question 0");
 	});
 
+	it("draws a focused subagent's full history, which /tree cannot browse", async () => {
+		const rendered = makeRenderCtx(transcriptWith(turns(4)), true, false, { "display.transcriptReplayLimit": 3 });
+		Object.assign(rendered.ctx, { focusedAgentId: "Scout" });
+		await new UiHelpers(rendered.ctx).renderInitialMessages({ clearTerminalHistory: true });
+		const text = Bun.stripANSI(rendered.chatContainer.render(120).join("\n"));
+
+		expect(text).not.toContain("earlier message");
+		expect(text).toContain("question 0");
+	});
+
 	it("uses the whole part of a fractional limit from config", async () => {
 		const { text } = await redraw(turns(4), { "display.transcriptReplayLimit": 3.5 });
 
